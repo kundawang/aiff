@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 
 	"github.com/go-audio/audio"
@@ -16,6 +17,11 @@ type Encoder struct {
 	SampleRate int
 	BitDepth   int
 	NumChans   int
+
+	// ChannelLayout, when set before the first write, is serialized as a CHAN
+	// chunk describing the channel order and labels of the audio data. Its
+	// channel count must match NumChans.
+	ChannelLayout *ChannelLayout
 
 	WrittenBytes    int
 	frames          int
@@ -133,10 +139,74 @@ func (e *Encoder) writeHeader() error {
 	if err := e.AddBE(audio.IntToIEEEFloat(int(e.SampleRate))); err != nil {
 		return fmt.Errorf("%v when writing comm sample rate", err)
 	}
+	// optional channel layout, written right after COMM so that decoders see
+	// it before the audio data.
+	if e.ChannelLayout != nil {
+		if err := e.writeChanChunk(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeChanChunk serializes the configured channel layout as a CHAN chunk.
+// The layout is validated against the encoder channel count first.
+func (e *Encoder) writeChanChunk() error {
+	layout := e.ChannelLayout
+	if layout == nil {
+		return nil
+	}
+	if err := layout.validate(e.NumChans); err != nil {
+		return err
+	}
+
+	if err := e.AddBE(chanID); err != nil {
+		return fmt.Errorf("%v when writing CHAN chunk ID header", err)
+	}
+	size := chanHeaderSize + chanDescriptionSize*len(layout.Descriptions)
+	if err := e.AddBE(uint32(size)); err != nil {
+		return fmt.Errorf("%v when writing CHAN chunk size header", err)
+	}
+	if err := e.AddBE(uint32(layout.Tag)); err != nil {
+		return fmt.Errorf("%v when writing CHAN layout tag", err)
+	}
+	if err := e.AddBE(uint32(layout.Bitmap)); err != nil {
+		return fmt.Errorf("%v when writing CHAN channel bitmap", err)
+	}
+	if err := e.AddBE(uint32(len(layout.Descriptions))); err != nil {
+		return fmt.Errorf("%v when writing CHAN description count", err)
+	}
+	for _, desc := range layout.Descriptions {
+		if err := e.AddBE(uint32(desc.Label)); err != nil {
+			return fmt.Errorf("%v when writing CHAN channel label", err)
+		}
+		if err := e.AddBE(desc.Flags); err != nil {
+			return fmt.Errorf("%v when writing CHAN channel flags", err)
+		}
+		for _, coord := range desc.Coordinates {
+			if err := e.AddBE(math.Float32bits(coord)); err != nil {
+				return fmt.Errorf("%v when writing CHAN channel coordinates", err)
+			}
+		}
+	}
+	// Chunks are word aligned, add a pad byte after an odd payload. A CHAN
+	// payload is 12+20*n and never odd, but keep the container rule local.
+	if size%2 != 0 {
+		if err := e.AddBE(uint8(0)); err != nil {
+			return fmt.Errorf("%v when writing CHAN padding", err)
+		}
+	}
 	return nil
 }
 
 func (e *Encoder) Write(buf *audio.IntBuffer) error {
+	if e.WrittenBytes == 0 && e.ChannelLayout != nil {
+		// fail before writing anything so a rejected layout doesn't leave a
+		// partially written file behind.
+		if err := e.ChannelLayout.validate(e.NumChans); err != nil {
+			return err
+		}
+	}
 	if err := e.writeHeader(); err != nil {
 		return err
 	}

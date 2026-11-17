@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 )
 
 // parseChunk processes a chunk and stores the valuable information
@@ -47,9 +48,11 @@ func (d *Decoder) parseChunk(chunk *Chunk) error {
 		}
 	// Apple specific: packed struct AudioChannelLayout of CoreAudio
 	case chanID:
-		// See https://github.com/nu774/qaac/blob/ce73aac9bfba459c525eec5350da6346ebf547cf/chanmap.cpp
-		// for format information
-		chunk.Done()
+		// See https://developer.apple.com/documentation/quicktime-file-format/audio_channel_layout_atom
+		if err := d.parseChanChunk(chunk); err != nil {
+			d.chanErr = err
+			return err
+		}
 	// Apple specific transient data
 	case trnsID:
 		// TODO extract and store the transients
@@ -117,6 +120,80 @@ func (d *Decoder) parseCommentsChunk(chunk *Chunk) error {
 		d.Comments = append(d.Comments, string(bytes.TrimRight(textB, "\x00")))
 	}
 
+	return nil
+}
+
+// parseChanChunk processes the CHAN chunk holding an AudioChannelLayout.
+// A file may only contain a single CHAN chunk. The layout channel count is
+// checked against the COMM channel count when the COMM chunk has already
+// been parsed, otherwise the check is deferred until the COMM chunk is read.
+func (d *Decoder) parseChanChunk(chunk *Chunk) (err error) {
+	defer func() {
+		// always consume the rest of the chunk, even on failure, so the
+		// chunk stream stays in sync for callers that keep reading.
+		chunk.Done()
+	}()
+	if chunk.ID != chanID {
+		return fmt.Errorf("unexpected CHAN chunk ID: %q", chunk.ID)
+	}
+	if d.ChannelLayout != nil {
+		return fmt.Errorf("%w (size %d)", ErrDuplicateChannelLayout, chunk.Size)
+	}
+	if chunk.Size < chanHeaderSize {
+		return fmt.Errorf("%w: %d bytes, need at least %d", ErrInvalidChannelLayoutSize, chunk.Size, chanHeaderSize)
+	}
+
+	header := make([]byte, chanHeaderSize)
+	if _, err := io.ReadFull(chunk, header); err != nil {
+		return fmt.Errorf("%w: %v", ErrTruncatedChannelLayout, err)
+	}
+	layout := &ChannelLayout{
+		Tag:    ChannelLayoutTag(binary.BigEndian.Uint32(header[0:4])),
+		Bitmap: ChannelBitmap(binary.BigEndian.Uint32(header[4:8])),
+	}
+	numDesc := binary.BigEndian.Uint32(header[8:12])
+
+	// Validate the declared description count before allocating anything.
+	if numDesc > maxChannelCount {
+		return fmt.Errorf("%w: %d channel descriptions", ErrTooManyChannels, numDesc)
+	}
+	descBytes := uint64(numDesc) * chanDescriptionSize
+	if uint64(chunk.Size) < uint64(chanHeaderSize)+descBytes {
+		return fmt.Errorf("%w: size %d can't hold %d channel descriptions (%d bytes needed)",
+			ErrTruncatedChannelLayout, chunk.Size, numDesc, chanHeaderSize+descBytes)
+	}
+	if numDesc > 0 {
+		raw := make([]byte, descBytes)
+		if _, err := io.ReadFull(chunk, raw); err != nil {
+			return fmt.Errorf("%w: %v", ErrTruncatedChannelLayout, err)
+		}
+		layout.Descriptions = make([]ChannelDescription, numDesc)
+		for i := range layout.Descriptions {
+			b := raw[i*chanDescriptionSize : (i+1)*chanDescriptionSize]
+			layout.Descriptions[i] = ChannelDescription{
+				Label: ChannelLabel(binary.BigEndian.Uint32(b[0:4])),
+				Flags: binary.BigEndian.Uint32(b[4:8]),
+				Coordinates: [3]float32{
+					math.Float32frombits(binary.BigEndian.Uint32(b[8:12])),
+					math.Float32frombits(binary.BigEndian.Uint32(b[12:16])),
+					math.Float32frombits(binary.BigEndian.Uint32(b[16:20])),
+				},
+			}
+		}
+	}
+
+	// Consume (and discard) any trailing bytes the chunk declares. A file
+	// shorter than the declared chunk size is truncated.
+	if err := chunk.drain(); err != nil {
+		return fmt.Errorf("%w: %v", ErrTruncatedChannelLayout, err)
+	}
+
+	if d.NumChans > 0 {
+		if err := layout.validate(int(d.NumChans)); err != nil {
+			return err
+		}
+	}
+	d.ChannelLayout = layout
 	return nil
 }
 

@@ -31,3 +31,35 @@ func ExampleDecoder_IsValidFile() {
 	fmt.Printf("is this file valid: %t", NewDecoder(f).IsValidFile())
 	// Output: is this file valid: true
 }
+
+func ExampleDecoder_ChannelLabels() {
+	f, err := os.Open("fixtures/ring.aif")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	d := NewDecoder(f)
+	d.ReadInfo()
+	fmt.Printf("layout: %s\n", d.ChannelLayout.Tag)
+	fmt.Printf("channels: %v\n", d.ChannelLabels())
+	// Output:
+	// layout: Stereo
+	// channels: [Left Right]
+}
+
+func ExampleChannelLayout() {
+	// Layouts can be built from a predefined tag, a channel bitmap or an
+	// explicit list of channel labels.
+	tag := NewChannelLayoutFromTag(ChannelLayoutTagMPEG_5_1_A)
+	bitmap := NewChannelLayoutFromBitmap(ChannelBitLeft | ChannelBitRight)
+	explicit := NewChannelLayoutFromLabels(ChannelLabelCenter, ChannelLabelLeft, ChannelLabelRight)
+
+	fmt.Println(tag.Labels())
+	fmt.Println(bitmap.Labels())
+	fmt.Println(explicit.Labels())
+	// Output:
+	// [Left Right Center LFE LeftSurroundDirect RightSurroundDirect]
+	// [Left Right]
+	// [Center Left Right]
+}

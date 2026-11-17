@@ -49,6 +49,14 @@ type Decoder struct {
 	HasAppleInfo bool
 	AppleInfo    AppleMetadata
 
+	// ChannelLayout holds the content of the CHAN chunk when the file has
+	// one. It gives the channel order and labels of the audio data. It is nil
+	// for files without a CHAN chunk (the channel order is then unspecified).
+	ChannelLayout *ChannelLayout
+	// chanErr records a CHAN parsing/validation failure independently of the
+	// main error state so that Err still reports it after a drain.
+	chanErr error
+
 	err             error
 	pcmDataAccessed bool
 
@@ -84,9 +92,12 @@ func (d *Decoder) PCMLen() int64 {
 // Err returns the first non-EOF error that was encountered by the Decoder.
 func (d *Decoder) Err() error {
 	if d.err == io.EOF {
-		return nil
+		return d.chanErr
 	}
-	return d.err
+	if d.err != nil {
+		return d.err
+	}
+	return d.chanErr
 }
 
 // EOF returns positively if the underlying reader reached the end of file.
@@ -105,6 +116,16 @@ func (d *Decoder) WasPCMAccessed() bool {
 	return d.pcmDataAccessed
 }
 
+// ChannelLabels returns the channel labels in the order the channels appear
+// in the audio data. It returns nil when the file has no CHAN chunk or when
+// the layout tag is unknown.
+func (d *Decoder) ChannelLabels() []ChannelLabel {
+	if d == nil {
+		return nil
+	}
+	return d.ChannelLayout.Labels()
+}
+
 // Format returns the audio format of the decoded content.
 func (d *Decoder) Format() *audio.Format {
 	if d == nil {
@@ -119,9 +140,8 @@ func (d *Decoder) Format() *audio.Format {
 // NextChunk returns the next available chunk
 func (d *Decoder) NextChunk() (*Chunk, error) {
 	// we need to read the info so we have access to the encoding.
-	if d.ReadInfo(); d.err != nil {
-		d.err = fmt.Errorf("failed to read info - %v", d.err)
-		return nil, d.err
+	if d.ReadInfo(); d.Err() != nil {
+		return nil, d.Err()
 	}
 
 	var (
@@ -153,7 +173,7 @@ func (d *Decoder) NextChunk() (*Chunk, error) {
 // IsValidFile verifies that the file is valid/readable.
 func (d *Decoder) IsValidFile() bool {
 	d.ReadInfo()
-	if d.err != nil {
+	if d.Err() != nil {
 		return false
 	}
 	if d.NumChans < 1 {
@@ -206,16 +226,19 @@ func (d *Decoder) Drain() error {
 		chunk, d.err = d.NextChunk()
 		if d.err != nil {
 			if d.err == io.EOF {
-				return nil
+				return d.chanErr
 			}
 			return d.err
 		}
 		if err := d.parseChunk(chunk); err != nil {
 			if err == io.EOF {
-				return nil
+				return d.chanErr
 			}
 			return err
 		}
+	}
+	if d.chanErr != nil {
+		return d.chanErr
 	}
 	return d.err
 }
@@ -227,12 +250,14 @@ func (d *Decoder) FwdToPCM() error {
 		d.err = fmt.Errorf("failed to read header - %v", d.err)
 		return nil
 	}
+	if d.chanErr != nil {
+		return d.chanErr
+	}
 
 	var chunk *Chunk
 	for d.err == nil {
 		chunk, d.err = d.NextChunk()
 		if d.err != nil {
-			d.err = fmt.Errorf("failed to read next chunk: %v", d.err)
 			return d.err
 		}
 
@@ -273,7 +298,7 @@ func (d *Decoder) FwdToPCM() error {
 		}
 
 		if err := d.parseChunk(chunk); err != nil {
-			return fmt.Errorf("failed to parse the chunk - %v", err)
+			return fmt.Errorf("failed to parse the chunk - %w", err)
 		}
 	}
 	return d.err
@@ -291,6 +316,8 @@ func (d *Decoder) Reset() {
 	d.SampleRate = 0
 	d.Encoding = [4]byte{}
 	d.EncodingName = ""
+	d.ChannelLayout = nil
+	d.chanErr = nil
 	d.err = nil
 	d.pcmDataAccessed = false
 	d.r.Seek(0, 0)
@@ -468,6 +495,16 @@ func (d *Decoder) String() string {
 		dur, _ := d.Duration()
 		out += fmt.Sprintf("Duration: %f seconds\n", dur.Seconds())
 	}
+	if d.ChannelLayout != nil {
+		out += fmt.Sprintf("Channel layout: %s (%d channels)\n", d.ChannelLayout.Tag, d.ChannelLayout.ChannelCount())
+		if labels := d.ChannelLabels(); len(labels) > 0 {
+			out += "Channel order:"
+			for _, label := range labels {
+				out += " " + label.String()
+			}
+			out += "\n"
+		}
+	}
 	if len(d.Comments) > 0 {
 		for _, comment := range d.Comments {
 			out += fmt.Sprintln(comment)
@@ -581,7 +618,12 @@ func (d *Decoder) ReadInfo() {
 				// we need to rewind rewindBytes+size of chunk ID and size
 				d.r.Seek(-(rewindBytes + int64(size) + 8), io.SeekCurrent)
 				rewindBytes = 0
+				return
 			}
+			// The CHAN chunk normally follows the COMM chunk. Parse it now
+			// so the layout is available without having to read the PCM data,
+			// while leaving the reader on the next unparsed chunk.
+			d.scanChannelLayout()
 			return
 		case COMTID:
 			chunk := &Chunk{
@@ -595,10 +637,20 @@ func (d *Decoder) ReadInfo() {
 		default:
 			// we haven't read the COMM chunk yet, we need to track location to rewind
 			if d.SampleRate == 0 {
-				rewindBytes += int64(size) + 8 // we add 8 for the ID and size of this chunk
+				// chunks before COMM are re-read by the regular chunk
+				// parsing, account for the word alignment pad as well.
+				rewindBytes += int64(size) + 8
+				if size%2 != 0 {
+					rewindBytes++
+				}
 			}
 			if d.err = d.jumpTo(int(size)); d.err != nil {
 				return
+			}
+			if size%2 != 0 {
+				if d.err = d.jumpTo(1); d.err != nil {
+					return
+				}
 			}
 		}
 	}
@@ -669,6 +721,47 @@ func (d *Decoder) parseCommChunk(size uint32) error {
 	}
 
 	return d.err
+}
+
+// newChunk wraps a freshly read chunk header. The chunk size includes the
+// word alignment pad byte when the payload size is odd, matching NextChunk.
+func (d *Decoder) newChunk(id [4]byte, size uint32) *Chunk {
+	chunkSize := int(size)
+	if size%2 != 0 {
+		// realign, the encoder lied about the size of the chunk header :(
+		chunkSize++
+	}
+	return &Chunk{
+		ID:   id,
+		Size: chunkSize,
+		R:    io.LimitReader(d.r, int64(chunkSize)),
+	}
+}
+
+// scanChannelLayout consumes consecutive CHAN chunks that immediately follow
+// the COMM chunk and stops before the first chunk it doesn't handle, leaving
+// the reader where the regular chunk parsing expects it.
+func (d *Decoder) scanChannelLayout() {
+	for d.chanErr == nil {
+		start, err := d.r.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return
+		}
+		id, size, err := d.iDnSize()
+		if err != nil {
+			// can't read another chunk header, restore the position.
+			d.r.Seek(start, io.SeekStart)
+			return
+		}
+		if id != chanID {
+			d.r.Seek(start, io.SeekStart)
+			return
+		}
+		if err := d.parseChanChunk(d.newChunk(id, size)); err != nil {
+			d.chanErr = err
+			return
+		}
+	}
 }
 
 // jumpTo advances the reader to the amount of bytes provided

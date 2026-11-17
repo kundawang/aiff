@@ -8,4 +8,8 @@
 Support for int PCM data wrapped in aiff format.
 AIFC/sowt format supported.
 
+Channel order and labels are read from (and written to) the `CHAN` chunk.
+Layouts can be predefined tags, channel bitmaps or explicit channel
+descriptions; see `Decoder.ChannelLabels` and `Encoder.ChannelLayout`.
+
 See [GoDoc](https://godoc.org/github.com/go-audio/aiff) for more details and examples.

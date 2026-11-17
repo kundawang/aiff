@@ -38,6 +38,8 @@ func TestEncoderRoundTrip(t *testing.T) {
 		{"fixtures/zipper24b.aiff", "testOutput/zipper24b.aiff", true},
 		// 2 ch,  44100 Hz, 'lpcm' (0x0000000E) 24-bit big-endian signed integer
 		{"fixtures/downsweep.aif", "testOutput/downsweep.aiff", true},
+		// 2 ch,  44100 Hz, 16-bit, stereo CHAN chunk
+		{"fixtures/ring.aif", "testOutput/ring.aif", false},
 	}
 
 	for i, tc := range testCases {
@@ -178,6 +180,8 @@ func TestBufferEncoderRoundTrip(t *testing.T) {
 		{"fixtures/zipper24b.aiff", "testOutput/zipper24b.aiff", true},
 		// 2 ch,  44100 Hz, 'lpcm' (0x0000000E) 24-bit big-endian signed integer
 		{"fixtures/downsweep.aif", "testOutput/downsweep.aiff", true},
+		// 2 ch,  44100 Hz, 16-bit, stereo CHAN chunk
+		{"fixtures/ring.aif", "testOutput/ring.aif", false},
 	}
 
 	for i, tc := range testCases {
